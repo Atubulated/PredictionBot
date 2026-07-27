@@ -98,6 +98,137 @@ def get_api_football_id(home: str, away: str, match_date: date) -> int | None:
         logger.warning(f"Could not map {home} vs {away} to API-Football: {e}")
         return None
 
+# ==========================================
+# 📊 LIVE STATISTICAL OBSERVATION SYSTEM
+# ==========================================
+
+async def fetch_and_store_yesterday_results():
+    """Fetch all match results from yesterday and store in Supabase"""
+    yesterday = date.today() - timedelta(days=1)
+    logger.info(f"📊 Fetching results for {yesterday}...")
+    
+    provider = ApiFootballProvider()
+    
+    try:
+        fixtures = provider.fixtures_by_date(yesterday.isoformat())
+        
+        for fixture in fixtures:
+            if fixture['fixture']['status']['short'] not in ['FT', 'AET', 'PEN']:
+                continue  # Skip unfinished matches
+            
+            match_data = {
+                'api_football_id': int(fixture['fixture']['id']),
+                'home_team': fixture['teams']['home']['name'],
+                'away_team': fixture['teams']['away']['name'],
+                'home_score': fixture['goals']['home'],
+                'away_score': fixture['goals']['away'],
+                'match_date': yesterday.isoformat(),
+                'league': fixture['league']['name'],
+                'home_shots': fixture.get('statistics', [{}])[0].get('Shots on Goal'),
+                'away_shots': fixture.get('statistics', [{}, {}])[1].get('Shots on Goal'),
+            }
+            
+            # Insert or ignore if already exists
+            supabase.table('match_results').insert(match_data).execute()
+            
+        logger.info(f"✅ Stored {len(fixtures)} match results from {yesterday}")
+        
+        # Update team statistics
+        await update_team_statistics()
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch yesterday's results: {e}")
+
+async def update_team_statistics():
+    """Calculate rolling statistics for each team"""
+    logger.info("📈 Updating team statistics...")
+    
+    # Get all unique teams
+    teams_response = supabase.table('match_results').select('home_team', 'away_team').execute()
+    
+    all_teams = set()
+    for row in teams_response.data:
+        all_teams.add(row['home_team'])
+        all_teams.add(row['away_team'])
+    
+    for team in all_teams:
+        # Get last 10 matches
+        matches = supabase.table('match_results').select('*').or_(
+            f"home_team.eq.{team},away_team.eq.{team}"
+        ).order('match_date', desc=True).limit(10).execute()
+        
+        if not matches.data:
+            continue
+        
+        # Calculate stats
+        wins = 0
+        draws = 0
+        losses = 0
+        goals_scored = 0
+        goals_conceded = 0
+        form = []
+        
+        for match in matches.data:
+            is_home = match['home_team'] == team
+            
+            if is_home:
+                team_goals = match['home_score']
+                opp_goals = match['away_score']
+            else:
+                team_goals = match['away_score']
+                opp_goals = match['home_score']
+            
+            goals_scored += team_goals
+            goals_conceded += opp_goals
+            
+            if team_goals > opp_goals:
+                wins += 1
+                form.append('W')
+            elif team_goals == opp_goals:
+                draws += 1
+                form.append('D')
+            else:
+                losses += 1
+                form.append('L')
+        
+        # Update team_stats table
+        supabase.table('team_stats').upsert({
+            'team_name': team,
+            'matches_played': len(matches.data),
+            'wins': wins,
+            'draws': draws,
+            'losses': losses,
+            'goals_scored': goals_scored,
+            'goals_conceded': goals_conceded,
+            'last_5_form': '-'.join(form[:5][::-1]),  # Most recent first
+            'last_updated': date.today().isoformat()
+        }, on_conflict='team_name').execute()
+    
+    logger.info("✅ Team statistics updated")
+
+def get_team_current_form(team_name: str) -> dict:
+    """Get a team's current form vs historical average"""
+    stats = supabase.table('team_stats').select('*').eq('team_name', team_name).execute()
+    
+    if not stats.data:
+        return None
+    
+    team_data = stats.data[0]
+    
+    # Calculate win rate
+    win_rate = team_data['wins'] / team_data['matches_played'] if team_data['matches_played'] > 0 else 0
+    goals_per_game = team_data['goals_scored'] / team_data['matches_played'] if team_data['matches_played'] > 0 else 0
+    conceded_per_game = team_data['goals_conceded'] / team_data['matches_played'] if team_data['matches_played'] > 0 else 0
+    
+    return {
+        'team': team_name,
+        'form': team_data['last_5_form'],
+        'win_rate': win_rate,
+        'goals_per_game': goals_per_game,
+        'conceded_per_game': conceded_per_game,
+        'recent_matches': team_data['matches_played']
+    }
+
 # 🌟 REPLACED SQLITE WITH SUPABASE INSERT
 def save_bet_slip_to_db(chat_id: int, legs: list, slip_type: str):
     slip_id = str(uuid.uuid4())[:8]
@@ -349,20 +480,32 @@ def process_bet_request(intent: dict, chat_id: int) -> dict:
 def main() -> None:
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     
+    # 1. Register Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("update_history", update_history_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_click))
     
+    # 2. Register Background Jobs
     try:
         from telegram.ext import JobQueue
+        
+        # Check finished bets every 30 minutes (1800 seconds), starting 10 seconds after boot
         app.job_queue.run_repeating(check_finished_matches, interval=1800, first=10)
+        
+        # Update historical JSON data daily at 3:00 AM WAT
         app.job_queue.run_daily(daily_history_update, time=datetime.time(3, 0, tzinfo=WAT))
-        logger.info("✅ Background jobs enabled.")
+        
+        # Fetch and store yesterday's match results daily at 4:00 AM WAT
+        # (PTB v21 handles async functions natively here, no lambda needed!)
+        app.job_queue.run_daily(fetch_and_store_yesterday_results, time=datetime.time(4, 0, tzinfo=WAT))
+        
+        logger.info("✅ Background jobs enabled (Match checking + Daily DB update + Live stats).")
+        
     except ImportError:
-        logger.warning("️ Install job-queue: pip install 'python-telegram-bot[job-queue]'")
+        logger.warning("⚠️ Install job-queue: pip install 'python-telegram-bot[job-queue]'")
 
-    print("🤖 Bot running in PURE QUANT MODE with Supabase Cloud DB...")
+    print("🤖 Bot running in PURE QUANT MODE with Supabase Cloud DB & Live Stats...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
