@@ -147,7 +147,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+    
+    # ️ Catch greetings so it doesn't try to scan for bets
+    if text in ['hello', 'hi', 'hey', 'start', 'help']:
+        await update.message.reply_text(
+            " Hi! I am your Quant Betting Assistant. \n\n"
+            "I don't do small talk, but I build mathematical accumulators. \n\n"
+            "Try asking: *'Give me a 5 odd accumulator for today'*", 
+            parse_mode="Markdown"
+        )
+        return
+
     status_msg = await update.message.reply_text("🔍 **Request Received!** Scanning historical data and markets... ⏳", parse_mode="Markdown")
+    # ... (leave the rest of the function exactly as it is)
     intent = router.parse_intent(update.message.text)
     if "error" in intent:
         await status_msg.edit_text("❌ Couldn't understand. Try: 'Give me 10 odds for today'")
