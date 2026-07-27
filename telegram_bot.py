@@ -5,6 +5,8 @@ import os
 import sys
 import uuid
 import datetime
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -39,7 +41,7 @@ http = JsonHttpClient(settings.user_agent)
 bet9ja = Bet9jaClient(http)
 router = IntentRouter(http, api_key=settings.nvidia_api_key)
 
-#  SUPABASE INITIALIZATION
+# 🌟 SUPABASE INITIALIZATION
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -280,18 +282,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
     
-    # ️ Catch greetings so it doesn't try to scan for bets
+    # 🛑 Catch greetings so it doesn't try to scan for bets
     if text in ['hello', 'hi', 'hey', 'start', 'help']:
         await update.message.reply_text(
-            " Hi! I am your Quant Betting Assistant. \n\n"
-            "I don't do small talk, but I build mathematical accumulators. \n\n"
+            "👋 Hi! I am your Quant Betting Assistant.\n\n"
+            "I don't do small talk, but I build mathematical accumulators.\n\n"
             "Try asking: *'Give me a 5 odd accumulator for today'*", 
             parse_mode="Markdown"
         )
         return
 
-    status_msg = await update.message.reply_text("🔍 **Request Received!** Scanning historical data and markets... ⏳", parse_mode="Markdown")
-    # ... (leave the rest of the function exactly as it is)
+    status_msg = await update.message.reply_text(" **Request Received!** Scanning historical data and markets... ⏳", parse_mode="Markdown")
     intent = router.parse_intent(update.message.text)
     if "error" in intent:
         await status_msg.edit_text("❌ Couldn't understand. Try: 'Give me 10 odds for today'")
@@ -400,7 +401,7 @@ def process_bet_request(intent: dict, chat_id: int) -> dict:
         return {"success": False, "message": f"❌ Bet9ja API error: {str(e)}"}
     
     if not events:
-        return {"success": False, "message": f"⚠️ No fixtures found for today ({target_date})."}
+        return {"success": False, "message": f"️ No fixtures found for today ({target_date})."}
 
     market_families = {MarketFamily(intent["market_family"])} if intent.get("market_family") and intent["market_family"] != "all" else None
     result = scan_events(events, history=history, min_edge=0.03, market_families=market_families)
@@ -440,7 +441,7 @@ def process_bet_request(intent: dict, chat_id: int) -> dict:
                 break
 
     if final_accumulator:
-        text = f"✅ **Quant Target Reached!**\n🎯 **Total Odds:** {final_accumulator.total_odds:.2f}\n️ **Risk:** {final_accumulator.max_risk_band.value}\n📊 **Legs:** {len(final_accumulator.legs)}\n\n**The Slip:**\n"
+        text = f"✅ **Quant Target Reached!**\n🎯 **Total Odds:** {final_accumulator.total_odds:.2f}\n⚠️ **Risk:** {final_accumulator.max_risk_band.value}\n📊 **Legs:** {len(final_accumulator.legs)}\n\n**The Slip:**\n"
         for i, leg in enumerate(final_accumulator.legs, 1):
             conf = leg.model_probability * 100
             text += f"{i}. *{format_wat_time(leg.fixture.starts_at)}* - {leg.fixture.label}\n   ➔ *{leg.market.selection}* ({conf:.0%} conf) @ {leg.market.odds:.2f}\n"
@@ -470,14 +471,34 @@ def process_bet_request(intent: dict, chat_id: int) -> dict:
                 future_opportunities.append(f" **{day_name}**: {edge_count} edges available")
         except Exception: pass
     
-    future_text = "\n\n🔮 **Upcoming Opportunities:**\n" + "\n".join(future_opportunities[:5]) if future_opportunities else "\n\n💡 *Check back when new leagues load their fixtures.*"
+    future_text = "\n\n🔮 **Upcoming Opportunities:**\n" + "\n".join(future_opportunities[:5]) if future_opportunities else "\n\n *Check back when new leagues load their fixtures.*"
 
     return {
         "success": False, 
         "message": f"⚠️ **Target Not Reached.**\n\nThe Quant Engine found only **{len(diverse_predictions)}** valid edge(s) for today.\n\nWith the current available matches, the maximum safe odds we can build is approximately **{max_possible_odds:.2f}**.\n\n💡 *Try lowering your target (e.g., 2.0 or 3.0 odds).*{future_text}"
     }
 
+# 🌟 RENDER FREE TIER HACK: Dummy server to keep the web service alive
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    
+    class DummyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive and running!")
+        
+        def log_message(self, format, *args):
+            pass  # Silence the dummy server logs
+            
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    print(f"🌐 Dummy server running on port {port} to keep Render happy.")
+    server.serve_forever()
+
 def main() -> None:
+    # 🌟 START THE DUMMY SERVER IN A BACKGROUND THREAD
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     
     # 1. Register Handlers
@@ -497,7 +518,6 @@ def main() -> None:
         app.job_queue.run_daily(daily_history_update, time=datetime.time(3, 0, tzinfo=WAT))
         
         # Fetch and store yesterday's match results daily at 4:00 AM WAT
-        # (PTB v21 handles async functions natively here, no lambda needed!)
         app.job_queue.run_daily(fetch_and_store_yesterday_results, time=datetime.time(4, 0, tzinfo=WAT))
         
         logger.info("✅ Background jobs enabled (Match checking + Daily DB update + Live stats).")
