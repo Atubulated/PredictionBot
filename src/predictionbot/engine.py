@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from predictionbot.domain import Fixture, HistoricalMatch, MarketFamily, MarketOdds, Prediction, Team
-from predictionbot.features import build_goal_profile
+from predictionbot.features import build_goal_profile, build_stat_profile, expected_stat_total
 from predictionbot.models.corners import (
     calculate_expected_corners,
     corner_over_probability,
 )
 from predictionbot.models.goals import (
+    btts_probability,
     estimate_expected_goals,
     estimate_expected_total,
     handicap_probability,
     outcome_probabilities,
+    poisson_cdf,
     probability_over,
 )
 from predictionbot.odds import implied_probability
@@ -209,6 +212,252 @@ def score_handicap_market(
     )
 
 
+def score_match_winner_market(
+    fixture: Fixture,
+    market: MarketOdds,
+    history: list[HistoricalMatch],
+    min_edge: float = 0.05,
+) -> Prediction | None:
+    """Score 1X2 markets from the same expected-goals model used elsewhere."""
+    if market.family != MarketFamily.MATCH_WINNER:
+        return None
+    home_profile = build_goal_profile(fixture.home.name, history)
+    away_profile = build_goal_profile(fixture.away.name, history)
+    if home_profile.matches == 0 or away_profile.matches == 0:
+        return None
+    home_expected, away_expected = estimate_expected_goals(home_profile, away_profile)
+    selection = market.selection.casefold()
+    outcomes = outcome_probabilities(home_expected, away_expected)
+    if "draw" in selection or selection in {"x", "tie"}:
+        model_probability = outcomes["draw"]
+    elif fixture.home.name.casefold() in selection or "home" in selection:
+        model_probability = outcomes["home"]
+    elif fixture.away.name.casefold() in selection or "away" in selection:
+        model_probability = outcomes["away"]
+    else:
+        return None
+    return _prediction_if_value(
+        fixture, market, model_probability, min_edge,
+        f"Expected goals {fixture.home.name} {home_expected:.2f}, {fixture.away.name} {away_expected:.2f}; 1X2 model {model_probability:.1%}.",
+    )
+
+
+def score_btts_market(
+    fixture: Fixture,
+    market: MarketOdds,
+    history: list[HistoricalMatch],
+    min_edge: float = 0.05,
+) -> Prediction | None:
+    if market.family != MarketFamily.BOTH_TEAMS_TO_SCORE:
+        return None
+    home_profile = build_goal_profile(fixture.home.name, history)
+    away_profile = build_goal_profile(fixture.away.name, history)
+    if home_profile.matches == 0 or away_profile.matches == 0:
+        return None
+    home_expected, away_expected = estimate_expected_goals(home_profile, away_profile)
+    yes_probability = btts_probability(home_expected, away_expected)
+    selection = market.selection.casefold()
+    if selection in {"yes", "gg", "true"} or "yes" in selection:
+        model_probability = yes_probability
+    elif selection in {"no", "ng", "false"} or "no" in selection:
+        model_probability = 1.0 - yes_probability
+    else:
+        return None
+    return _prediction_if_value(
+        fixture, market, model_probability, min_edge,
+        f"Expected goals {home_expected:.2f}-{away_expected:.2f}; BTTS model {model_probability:.1%}.",
+    )
+
+
+def score_team_total_market(
+    fixture: Fixture,
+    market: MarketOdds,
+    history: list[HistoricalMatch],
+    min_edge: float = 0.05,
+) -> Prediction | None:
+    if market.family != MarketFamily.TEAM_TOTALS:
+        return None
+    selection = market.selection.casefold()
+    team = fixture.home if ("home" in selection or fixture.home.name.casefold() in selection) else fixture.away
+    profile = build_goal_profile(team.name, history)
+    if profile.matches == 0:
+        return None
+    opponent = fixture.away if team == fixture.home else fixture.home
+    opponent_profile = build_goal_profile(opponent.name, history)
+    if opponent_profile.matches == 0:
+        return None
+    home_expected, away_expected = estimate_expected_goals(
+        build_goal_profile(fixture.home.name, history),
+        build_goal_profile(fixture.away.name, history),
+    )
+    expected = home_expected if team == fixture.home else away_expected
+    line = market.line or _extract_line(market.market) or _extract_line(market.selection)
+    if line is None or ("over" not in selection and "under" not in selection):
+        return None
+    over = 1.0 - poisson_cdf(int(line), expected)
+    model_probability = over if "over" in selection else 1.0 - over
+    return _prediction_if_value(
+        fixture, market, model_probability, min_edge,
+        f"Expected {team.name} goals {expected:.2f}; team-total model {model_probability:.1%}.",
+    )
+
+
+def _period_total_probability(market: MarketOdds, fixture: Fixture, history: list[HistoricalMatch], period: str, min_edge: float) -> Prediction | None:
+    if market.family not in {MarketFamily.FIRST_HALF_TOTALS, MarketFamily.SECOND_HALF_TOTALS}:
+        return None
+    line = market.line or _extract_line(market.market) or _extract_line(market.selection)
+    selection = market.selection.casefold()
+    if line is None or ("over" not in selection and "under" not in selection):
+        return None
+    totals =[]
+    for match in history:
+        raw = match.raw or {}
+        home = raw.get(f"{period}_home_goals", raw.get(f"{period}_home_score"))
+        away = raw.get(f"{period}_away_goals", raw.get(f"{period}_away_score"))
+        if home is None or away is None:
+            continue
+        if {match.home.casefold(), match.away.casefold()} & {fixture.home.name.casefold(), fixture.away.name.casefold()}:
+            totals.append(float(home) + float(away))
+    if len(totals) < 3:
+        return None
+    expected = sum(totals[-10:]) / len(totals[-10:])
+    over = probability_over(line, expected)
+    model_probability = over if "over" in selection else 1.0 - over
+    return _prediction_if_value(
+        fixture, market, model_probability, min_edge,
+        f"Expected {period.replace('_', ' ')} goals {expected:.2f}; period-total model {model_probability:.1%}.",
+    )
+
+
+def score_period_totals_market(fixture, market, history, min_edge=0.05):
+    period = "ht" if market.family == MarketFamily.FIRST_HALF_TOTALS else "second_half"
+    return _period_total_probability(market, fixture, history, period, min_edge)
+
+
+# Per-team stat markets: (stat name in features._STAT_FIELDS, league-average team total, min samples).
+_STAT_MARKET_CONFIG = {
+    MarketFamily.SHOTS: ("shots", 12.0, 4),
+    MarketFamily.SHOTS_ON_TARGET: ("shots", 4.5, 4),
+    MarketFamily.BOOKINGS: ("cards", 2.1, 5),
+}
+
+
+def score_stat_market(
+    fixture: Fixture,
+    market: MarketOdds,
+    history: list[HistoricalMatch],
+    min_edge: float = 0.05,
+) -> Prediction | None:
+    """Score data-backed per-team stat markets (shots, shots on target, cards).
+
+    Requires enough observed history on BOTH teams before producing a model
+    result, so fixtures without stat coverage fall through to consensus rather
+    than manufacturing a fake model probability.
+    """
+    config = _STAT_MARKET_CONFIG.get(market.family)
+    if config is None:
+        return None
+    stat, league_avg_team, min_samples = config
+
+    selection = market.selection.casefold()
+    if "over" not in selection and "under" not in selection:
+        return None
+    line = market.line or _extract_line(market.market) or _extract_line(market.selection)
+    if line is None:
+        return None
+
+    home_profile = build_stat_profile(fixture.home.name, stat, history)
+    away_profile = build_stat_profile(fixture.away.name, stat, history)
+    if home_profile.samples < min_samples or away_profile.samples < min_samples:
+        return None
+
+    expected_total = expected_stat_total(home_profile, away_profile, league_avg_team)
+    if expected_total <= 0:
+        return None
+
+    over = corner_over_probability(line, expected_total)  # Poisson tail, same shape as corners
+    model_probability = over if "over" in selection else 1.0 - over
+    return _prediction_if_value(
+        fixture, market, model_probability, min_edge,
+        f"Expected total {stat} {expected_total:.2f} "
+        f"({home_profile.samples}+{away_profile.samples} samples); model {model_probability:.1%}.",
+    )
+
+
+# Full model confidence is reached at this many recent matches PER SIDE.
+# Major leagues in season clear it easily (deep history -> solid, un-suppressed
+# edges); thin lower-tier/pre-season fixtures score low and get quarantined by
+# the slip builder instead of printing over-confident nonsense.
+DATA_CONFIDENCE_ANCHOR = 8.0
+
+# The most of the model's DISAGREEMENT with the bookmaker we are ever willing to
+# back, even with a full history behind it. A closing line is an efficient
+# estimate; our Poisson model is a *tilt* on it, not a replacement. At trust 0.5
+# a raw model edge of +30% is only ever staked as +15%, and thin-history fixtures
+# (low data_confidence) shrink further toward the market. This is the root-cause
+# cure for "Model: 97.1% / edge +33%" nonsense — it caps overconfidence for EVERY
+# league, not just the thin ones.
+MODEL_MAX_TRUST = 0.5
+
+
+def _data_confidence(
+    fixture: Fixture,
+    history: list[HistoricalMatch],
+    family: MarketFamily,
+) -> float:
+    """0..1 measure of how much team history actually backs this fixture.
+
+    Uses the same profile the scorer used (stat samples for stat markets, goal
+    matches otherwise) and takes the WEAKER side — a pick is only as trustworthy
+    as the thinner of its two teams. Ramps linearly to 1.0 at
+    DATA_CONFIDENCE_ANCHOR matches/side.
+    """
+    stat_cfg = _STAT_MARKET_CONFIG.get(family)
+    if stat_cfg is not None:
+        stat, _league_avg, _min_samples = stat_cfg
+        home = build_stat_profile(fixture.home.name, stat, history)
+        away = build_stat_profile(fixture.away.name, stat, history)
+        n_eff = min(home.samples, away.samples)
+    else:
+        home = build_goal_profile(fixture.home.name, history)
+        away = build_goal_profile(fixture.away.name, history)
+        n_eff = min(home.matches, away.matches)
+    return max(0.0, min(1.0, n_eff / DATA_CONFIDENCE_ANCHOR))
+
+
+def _calibrate_to_market(prediction: Prediction, data_confidence: float) -> Prediction:
+    """Anchor the model's probability to the bookmaker line.
+
+    The raw Poisson output is only trusted in proportion to
+    ``MODEL_MAX_TRUST × data_confidence``; the rest of the weight sits on the
+    market's implied probability. The result:
+
+        calibrated = book + trust × (model − book)
+        calibrated_edge = trust × raw_edge
+
+    so a fantasy +33% collapses to a believable single-digit edge (and a genuine
+    deep-history +8% survives as a solid ~+4%), instead of the model claiming a
+    market misprices by 22 points. The uncalibrated value is preserved in
+    ``raw_model_probability`` for transparency, and the safe-odds band + edge are
+    re-derived from the calibrated probability.
+    """
+    trust = MODEL_MAX_TRUST * data_confidence
+    book = prediction.implied_probability
+    raw = prediction.model_probability
+    calibrated = book + trust * (raw - book)
+    calibrated = max(0.0, min(1.0, calibrated))
+    band = DEFAULT_SAFE_ODDS_RULE.classify(calibrated)
+    return replace(
+        prediction,
+        model_probability=calibrated,
+        raw_model_probability=raw,
+        edge=calibrated - book,
+        safe_odds_band=band,
+        confidence=band.value,
+        data_confidence=data_confidence,
+    )
+
+
 def score_market(
     fixture: Fixture,
     market: MarketOdds,
@@ -217,14 +466,31 @@ def score_market(
 ) -> Prediction | None:
     scorers = {
         MarketFamily.TOTALS: score_totals_market,
-        MarketFamily.CORNERS: score_corners_market,  # <-- NEW: Wired up corners
+        MarketFamily.CORNERS: score_corners_market,
         MarketFamily.DOUBLE_CHANCE: score_double_chance_market,
         MarketFamily.HANDICAP: score_handicap_market,
+        MarketFamily.MATCH_WINNER: score_match_winner_market,
+        MarketFamily.BOTH_TEAMS_TO_SCORE: score_btts_market,
+        MarketFamily.TEAM_TOTALS: score_team_total_market,
+        MarketFamily.FIRST_HALF_TOTALS: score_period_totals_market,
+        MarketFamily.SECOND_HALF_TOTALS: score_period_totals_market,
+        MarketFamily.SHOTS: score_stat_market,
+        MarketFamily.SHOTS_ON_TARGET: score_stat_market,
+        MarketFamily.BOOKINGS: score_stat_market,
     }
     scorer = scorers.get(market.family)
     if scorer is None:
         return None
-    return scorer(fixture, market, history, min_edge=min_edge)
+    prediction = scorer(fixture, market, history, min_edge=min_edge)
+    if prediction is None:
+        return None
+    # This is the single choke point both production paths (scanner + telegram)
+    # flow through, while the unit tests call the individual scorers directly and
+    # keep the raw output — so calibration is applied to the live bot without
+    # touching a single existing test assertion.
+    confidence = _data_confidence(fixture, history, market.family)
+    return _calibrate_to_market(prediction, confidence)
+
 
 
 def score_fixture_markets(

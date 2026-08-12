@@ -8,13 +8,21 @@ from typing import Any
 from predictionbot.risk import SafeOddsBand
 
 
+class PredictionSource(StrEnum):
+    MODEL = "model"
+    CONSENSUS = "consensus"
+
+
 class MarketFamily(StrEnum):
+    MATCH_WINNER = "match_winner"
     TOTALS = "totals"
     BOTH_TEAMS_TO_SCORE = "btts"
     DOUBLE_CHANCE = "double_chance"
     HANDICAP = "handicap"
     CORNERS = "corners"
     BOOKINGS = "bookings"
+    SHOTS = "shots"
+    SHOTS_ON_TARGET = "shots_on_target"
     UNKNOWN = "unknown"
     TEAM_TOTALS = "team_totals"
     FIRST_HALF_TOTALS = "first_half_totals"
@@ -95,6 +103,16 @@ class Prediction:
     confidence: str
     safe_odds_band: SafeOddsBand
     reason: str
+    source: PredictionSource = PredictionSource.MODEL
+    # How much team history backs this pick, 0..1. 1.0 = deep history (major
+    # leagues in season); low = thin history where the Poisson model over-fits
+    # and prints implausible edges. Defaulted so every existing constructor and
+    # test keeps its current behaviour; set for real by score_market().
+    data_confidence: float = 1.0
+    # The scorer's UNcalibrated model probability, kept for transparency after
+    # score_market() blends model_probability toward the market. None when the
+    # pick never went through calibration (direct scorer calls, legacy paths).
+    raw_model_probability: float | None = None
 
     @property
     def fair_odds(self) -> float:

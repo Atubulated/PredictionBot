@@ -13,4 +13,4 @@ def test_ai_reviewer_skips_without_api_key() -> None:
     review = reviewer.review_predictions([])
 
     assert not review.enabled
-    assert "NVIDIA_API_KEY" in review.text
+    assert "NVIDIA API key" in review.text

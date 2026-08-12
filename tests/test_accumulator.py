@@ -3,7 +3,7 @@ from datetime import datetime
 from predictionbot.accumulator import build_accumulator, build_progressive_accumulator
 from predictionbot.domain import Fixture, MarketFamily, MarketOdds, Prediction, Team
 from predictionbot.engine import demo_accumulator_predictions
-from predictionbot.risk import SafeOddsBand
+from predictionbot.risk import DEFAULT_SAFE_ODDS_RULE, SafeOddsBand
 
 
 def test_accumulator_reaches_demo_target_odds() -> None:
@@ -11,7 +11,8 @@ def test_accumulator_reaches_demo_target_odds() -> None:
 
     assert accumulator.reached_target
     assert accumulator.total_odds >= 10
-    assert all(leg.safe_odds_band == SafeOddsBand.VERY_SAFE for leg in accumulator.legs)
+    # Demo predictions are classified with the current 0.95 VERY_SAFE threshold.
+    assert all(leg.safe_odds_band == SafeOddsBand.SAFE for leg in accumulator.legs)
 
 
 def test_accumulator_uses_one_leg_per_fixture() -> None:
@@ -32,18 +33,22 @@ def test_accumulator_filters_to_requested_band() -> None:
         _prediction(fixture, "Safe leg", 1.5, 0.85),
     ]
 
-    accumulator = build_accumulator(predictions, target_odds=1.2)
+    accumulator = build_accumulator(
+        predictions, target_odds=1.2, band=SafeOddsBand.VERY_SAFE
+    )
 
     assert accumulator.legs == []
 
 
-def test_progressive_accumulator_relaxes_risk_to_reach_bigger_target() -> None:
+def test_progressive_accumulator_reports_target_unreachable_when_odds_cap_filters_high_legs() -> None:
+    # The 2.0 per-leg cap intentionally excludes the demo's 2.05+ longshots, so
+    # 1000x is unreachable even after risk relaxation.
     accumulator = build_progressive_accumulator(demo_accumulator_predictions(), target_odds=1000)
 
-    assert accumulator.reached_target
-    assert SafeOddsBand.VERY_SAFE.value in accumulator.risk_bands_used
+    assert not accumulator.reached_target
+    assert accumulator.legs
+    assert all(leg.market.odds <= 2.0 for leg in accumulator.legs)
     assert SafeOddsBand.SAFE.value in accumulator.risk_bands_used
-    assert SafeOddsBand.MEDIUM_RISK.value in accumulator.risk_bands_used
 
 
 def test_progressive_accumulator_reports_unreachable_target() -> None:
@@ -57,14 +62,7 @@ def test_progressive_accumulator_reports_unreachable_target() -> None:
 
 
 def _prediction(fixture: Fixture, selection: str, odds: float, probability: float) -> Prediction:
-    if probability >= 0.90:
-        band = SafeOddsBand.VERY_SAFE
-    elif probability >= 0.80:
-        band = SafeOddsBand.SAFE
-    elif probability >= 0.65:
-        band = SafeOddsBand.MEDIUM_RISK
-    else:
-        band = SafeOddsBand.HIGH_RISK
+    band = DEFAULT_SAFE_ODDS_RULE.classify(probability)
     return Prediction(
         fixture=fixture,
         market=MarketOdds("book", fixture.source_id, MarketFamily.UNKNOWN, "Demo market", selection, odds),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from http.cookiejar import CookieJar
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -64,10 +65,36 @@ class JsonHttpClient:
             data=data,
             method=method,
         )
-        try:
-            with self.opener.open(request, timeout=timeout) as response:
-                return response.read().decode("utf-8")
-        except HTTPError as exc:
-            raise HttpClientError(f"HTTP {exc.code} while fetching {url}") from exc
-        except URLError as exc:
-            raise HttpClientError(f"Network error while fetching {url}: {exc.reason}") from exc
+        
+        max_retries = 4
+        backoff = 2.0
+        
+        for attempt in range(max_retries):
+            try:
+                with self.opener.open(request, timeout=timeout) as response:
+                    return response.read().decode("utf-8")
+            except HTTPError as exc:
+                # Handle Rate Limiting (429)
+                if exc.code == 429 and attempt < max_retries - 1:
+                    retry_after = int(exc.headers.get("Retry-After", backoff))
+                    time.sleep(retry_after)
+                    continue
+                # Retry on Server Errors (5xx)
+                if exc.code >= 500 and attempt < max_retries - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                raise HttpClientError(f"HTTP {exc.code} while fetching {url}") from exc
+            except URLError as exc:
+                # Retry on Network/DNS errors
+                if attempt < max_retries - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                raise HttpClientError(f"Network error while fetching {url}: {exc.reason}") from exc
+            except Exception as exc:
+                if attempt < max_retries - 1:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                raise HttpClientError(f"Unexpected error while fetching {url}: {exc}") from exc

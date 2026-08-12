@@ -14,7 +14,7 @@ class SafeOddsBand(StrEnum):
 @dataclass(frozen=True)
 class SafeOddsRule:
     min_safe_probability: float = 0.80
-    min_very_safe_probability: float = 0.90
+    min_very_safe_probability: float = 0.95
     min_medium_probability: float = 0.65
 
     def classify(self, probability: float) -> SafeOddsBand:

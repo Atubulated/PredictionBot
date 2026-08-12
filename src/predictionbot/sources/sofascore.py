@@ -35,6 +35,32 @@ class SofascoreClient:
         response.raise_for_status()
         return response.json()
 
+    def unique_tournament_seasons(self, tournament_id: int) -> list[dict[str, Any]]:
+        """List available seasons for a unique tournament (most recent first)."""
+        url = f"{self.base_url}/unique-tournament/{tournament_id}/seasons"
+        response = self.session.get(url)
+        response.raise_for_status()
+        return response.json().get("seasons", [])
+
+    def tournament_events_last(
+        self, tournament_id: int, season_id: int, page: int = 0
+    ) -> list[Fixture]:
+        """Return finished events for a tournament season, one page at a time.
+
+        ``/events/last/{page}`` is the working replacement for the retired
+        ``scheduled-events/{date}`` endpoint. Page 0 is the most recent block of
+        finished matches; higher pages walk further back. A 404 marks the end of
+        pagination and is surfaced as an empty list by the caller.
+        """
+        url = (
+            f"{self.base_url}/unique-tournament/{tournament_id}"
+            f"/season/{season_id}/events/last/{page}"
+        )
+        response = self.session.get(url)
+        response.raise_for_status()
+        payload = response.json()
+        return [self._fixture_from_event(event) for event in payload.get("events", [])]
+
     def event_incidents(self, event_id: str) -> dict[str, Any]:
         url = f"{self.base_url}/event/{event_id}/incidents"
         response = self.session.get(url)

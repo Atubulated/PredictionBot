@@ -12,3 +12,11 @@ vendor_downloads/
 *.db
 *.pyc
 .vscode/
+# Caches and Logs
+.event_cache/
+src/.api_cache/
+*.log
+debug_understat.html
+.env
+__pycache__/
+*.pyc

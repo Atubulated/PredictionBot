@@ -311,13 +311,15 @@ def _parse_bet9ja_timestamp(value: Any) -> datetime | None:
 def _markets_from_listed_event(fixture: Fixture, raw_event: dict[str, Any]) -> list[MarketOdds]:
     odds = raw_event.get("O") or {}
     definitions = [
-        ("Match Result", "Home", odds.get("S_1X2_1"), MarketFamily.UNKNOWN),
-        ("Match Result", "Draw", odds.get("S_1X2_X"), MarketFamily.UNKNOWN),
-        ("Match Result", "Away", odds.get("S_1X2_2"), MarketFamily.UNKNOWN),
+        # FIX: Changed MarketFamily.UNKNOWN to MarketFamily.MATCH_WINNER
+        ("Match Result", "Home", odds.get("S_1X2_1"), MarketFamily.MATCH_WINNER),
+        ("Match Result", "Draw", odds.get("S_1X2_X"), MarketFamily.MATCH_WINNER),
+        ("Match Result", "Away", odds.get("S_1X2_2"), MarketFamily.MATCH_WINNER),
         ("Double Chance", "Home or Draw", odds.get("S_DC_1X"), MarketFamily.DOUBLE_CHANCE),
         ("Double Chance", "Home or Away", odds.get("S_DC_12"), MarketFamily.DOUBLE_CHANCE),
         ("Double Chance", "Draw or Away", odds.get("S_DC_X2"), MarketFamily.DOUBLE_CHANCE),
     ]
+    # ... rest of the function remains exactly the same ...
     markets = []
     for market_name, selection, odds_value, family in definitions:
         decimal_odds = _coerce_float(odds_value)

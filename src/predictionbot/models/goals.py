@@ -30,24 +30,39 @@ def estimate_expected_total(home: TeamGoalProfile, away: TeamGoalProfile, league
 def estimate_expected_goals(
     home: TeamGoalProfile,
     away: TeamGoalProfile,
-    league_avg_total: float = 2.65,
+    league_avg_home_goals: float = 1.45,  # Separating home/away gives us Home Advantage logic
+    league_avg_away_goals: float = 1.20,
+    league_avg_total: float = 2.65,       # <-- Added to catch the scanner's parameter
+    **kwargs                              # <-- Safety net for future parameters
 ) -> tuple[float, float]:
+    
     if home.matches == 0 and away.matches == 0:
-        return league_avg_total / 2, league_avg_total / 2
+        return league_avg_home_goals, league_avg_away_goals
 
-    home_component = (home.goals_for_avg + away.goals_against_avg) / 2 if away.matches else home.goals_for_avg
-    away_component = (away.goals_for_avg + home.goals_against_avg) / 2 if home.matches else away.goals_for_avg
-    estimated_total = home_component + away_component
+    # Safe fallbacks to prevent ZeroDivisionError
+    league_avg_home_goals = max(league_avg_home_goals, 0.1)
+    league_avg_away_goals = max(league_avg_away_goals, 0.1)
 
-    if estimated_total <= 0:
-        return league_avg_total / 2, league_avg_total / 2
+    # 1. Calculate Attack Strengths (Team Scored / League Scored)
+    home_attack = home.goals_for_avg / league_avg_home_goals if home.matches else 1.0
+    away_attack = away.goals_for_avg / league_avg_away_goals if away.matches else 1.0
 
-    # Blend with league average so tiny samples do not swing too wildly.
+    # 2. Calculate Defense Strengths (Team Conceded / League Conceded)
+    # Note: Home defense is compared against Away league average, and vice versa
+    home_defense = home.goals_against_avg / league_avg_away_goals if home.matches else 1.0
+    away_defense = away.goals_against_avg / league_avg_home_goals if away.matches else 1.0
+
+    # 3. Calculate Base Expected Goals (Attack * Opponent Defense * League Avg)
+    home_expected = home_attack * away_defense * league_avg_home_goals
+    away_expected = away_attack * home_defense * league_avg_away_goals
+
+    # 4. Blend with league average for tiny samples (Keeping your excellent sample weight logic!)
     sample_weight = min((home.matches + away.matches) / 20, 1)
-    blended_total = (estimated_total * sample_weight) + (league_avg_total * (1 - sample_weight))
-    scale = blended_total / estimated_total
-    return home_component * scale, away_component * scale
+    
+    home_blended = (home_expected * sample_weight) + (league_avg_home_goals * (1 - sample_weight))
+    away_blended = (away_expected * sample_weight) + (league_avg_away_goals * (1 - sample_weight))
 
+    return home_blended, away_blended
 
 def outcome_probabilities(home_expected: float, away_expected: float, max_goals: int = 10) -> dict[str, float]:
     home_win = 0.0
@@ -88,3 +103,10 @@ def handicap_probability(
             elif selection_side == "away" and away_goals + line > home_goals:
                 hit += score_probability
     return hit / total if total > 0 else 0.0
+
+def btts_probability(home_expected: float, away_expected: float) -> float:
+    # Probability of NOT scoring 0 goals
+    home_scores = 1 - poisson_pmf(0, home_expected)
+    away_scores = 1 - poisson_pmf(0, away_expected)
+    
+    return home_scores * away_scores
