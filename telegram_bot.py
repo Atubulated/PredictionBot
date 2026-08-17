@@ -123,7 +123,7 @@ MAX_ODDS_PER_LEG = 3.5
 # the slip. Note the math: you CANNOT build 10x out of only 80%+ legs (80% ≈ 1.25
 # odds, six of them ≈ 3.8x), so reaching a big target forces a few 60–70% legs —
 # this floor just guarantees the worst leg is still a ~3-in-5 shot, not a toss-up.
-MIN_LEG_PROBABILITY = 0.80
+MIN_LEG_PROBABILITY = 0.65
 # Hedge markets. Asian Handicap and Double Chance are demoted to last-resort
 # filler: the slip is built from decisive, data-fit markets first, and at most one
 # of each of these is added, and only if the target still isn't reached.
