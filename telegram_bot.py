@@ -729,6 +729,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     iso_dates = re.findall(r"\d{4}-\d{2}-\d{2}", update.message.text)
     if iso_dates:
         intent["date"] = iso_dates[0]
+        intent["strict_date"] = True  # NEW: flag for strict date adherence
         if len(iso_dates) > 1:
             intent["end_date"] = iso_dates[1]
         logger.info(f"📅 Regex date override: {intent['date']} -> {intent.get('end_date')}")
@@ -906,9 +907,13 @@ def process_bet_request(intent: dict, chat_id: int) -> dict:
 
     events = []
     start_date = target_date
-    if intent.get("end_date"):
-        try: end_date = date.fromisoformat(intent["end_date"])
-        except Exception: end_date = start_date + timedelta(days=4)
+    if intent.get("strict_date"):
+        end_date = start_date  # Strict: only scout the specified date
+    elif intent.get("end_date"):
+        try:
+            end_date = date.fromisoformat(intent["end_date"])
+        except Exception:
+            end_date = start_date + timedelta(days=4)
     else:
         end_date = start_date + timedelta(days=4)
     if (end_date - start_date).days > 6:
@@ -1130,52 +1135,39 @@ def process_bet_request(intent: dict, chat_id: int) -> dict:
     def _is_lay_goals_handicap(pred) -> bool:
         return pred.market.family == MarketFamily.HANDICAP and (pred.market.line or 0) < 0
 
-    # 🎯 DYNAMIC DIVERSITY (Round-Robin Selection)
-    # Instead of rigid quotas, we gather all safe bets and take the best available 
-    # from EACH market family before circling back. This naturally creates an organic mix 
-    # like "2 Overs, 2 Winners, 1 BTTS, 1 Corner".
-    safe_by_family = defaultdict(list)
+        # 🎯 VALUE-FIRST SELECTION WITH SOFT DIVERSITY
+    # Pick the best value bets to reach the target, allowing multiple bets per
+    # fixture when necessary. Prioritizes edge (value) over strict diversity.
+    all_preds = []
     for family, preds in family_groups.items():
         for pred in preds:
             if pred.model_probability >= MIN_LEG_PROBABILITY and \
                pred.edge >= 0.01 and \
                not _is_lay_goals_handicap(pred):
-                safe_by_family[family].append(pred)
-                
-    # Sort each family's list by probability (safest bets first)
-    for family in safe_by_family:
-        safe_by_family[family].sort(key=lambda p: p.model_probability, reverse=True)
-
-    diverse_predictions = []
-    used_fixtures = set()
+                all_preds.append(pred)
     
-    # Keep looping until we hit our leg limit (6) or run out of safe options
-    while len(diverse_predictions) < PRO_MAX_LEGS:
-        added_this_round = False
-        
-        # Sort families dynamically: prioritize the family whose top remaining bet is the safest today
-        sorted_families = sorted(
-            [f for f in safe_by_family if safe_by_family[f]], # only families with bets left
-            key=lambda f: safe_by_family[f][0].model_probability,
-            reverse=True
-        )
-        
-        for family in sorted_families:
-            if len(diverse_predictions) >= PRO_MAX_LEGS:
-                break
-                
-            # Find the best unused prediction in this family
-            for pred in safe_by_family[family]:
-                if pred.fixture.source_id not in used_fixtures:
-                    diverse_predictions.append(pred)
-                    used_fixtures.add(pred.fixture.source_id)
-                    safe_by_family[family].remove(pred) # Remove so it's not picked again in the next lap
-                    added_this_round = True
-                    break # Move to the next market family
-                    
-        # If we went through all families and didn't add any new legs, we are out of options
-        if not added_this_round:
+    # Sort by edge (best value first)
+    all_preds.sort(key=lambda p: p.edge, reverse=True)
+    
+    # Pick top bets, allowing up to 2 per fixture for diversity
+    diverse_predictions = []
+    fixture_counts = defaultdict(int)
+    MAX_PER_FIXTURE = 2
+    
+    for pred in all_preds:
+        if len(diverse_predictions) >= PRO_MAX_LEGS:
             break
+        if fixture_counts[pred.fixture.source_id] < MAX_PER_FIXTURE:
+            diverse_predictions.append(pred)
+            fixture_counts[pred.fixture.source_id] += 1
+    
+    # If we still have slots, fill with best value regardless of fixture
+    if len(diverse_predictions) < PRO_MAX_LEGS:
+        for pred in all_preds:
+            if pred not in diverse_predictions:
+                if len(diverse_predictions) >= PRO_MAX_LEGS:
+                    break
+                diverse_predictions.append(pred)
 
     if not diverse_predictions:
         return {"success": False, "message": "❌ No mathematically viable edges found (all predictions had negative or near-zero edges)."}
